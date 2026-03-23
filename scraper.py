@@ -1,7 +1,7 @@
 """
-YikYak Morning Digest
-Hits YikYak's internal API directly (no browser needed).
-Sends a formatted digest email via Gmail SMTP.
+VC & Startup Morning Digest
+Pulls latest stories from TechCrunch, Crunchbase News, VentureBeat,
+and StrictlyVC via RSS and sends a formatted digest email via Gmail.
 
 Env vars required:
   GMAIL_USER  — your Gmail address
@@ -9,139 +9,155 @@ Env vars required:
   TO_EMAIL    — recipient email
 """
 
-import os, requests, smtplib, json
-from datetime import date
+import os, smtplib, feedparser
+from datetime import date, datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 # ── Config ────────────────────────────────────────────────────────────────────
-UT_LAT  = 30.2849    # UT Austin latitude
-UT_LNG  = -97.7341   # UT Austin longitude
-TOP_N   = 10         # posts to include
-MIN_VOTES = 3
+TOP_N = 10
 
-# ── Fetch posts ───────────────────────────────────────────────────────────────
-def fetch_top_yaks():
-    """
-    YikYak serves a public hot-feed endpoint that returns posts near
-    a given lat/lng. No auth required for reading.
-    """
-    url = "https://yikyak.com/api/fetch/v2/feed/hot"
-    params = {
-        "lat": UT_LAT,
-        "long": UT_LNG,
-        "feedType": "hot",
-    }
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
-        "Accept": "application/json",
-        "Referer": "https://yikyak.com/",
-        "Origin": "https://yikyak.com",
-    }
+FEEDS = [
+    {
+        "name": "TechCrunch",
+        "url": "https://techcrunch.com/category/venture/feed/",
+        "color": "#0a8a00",
+    },
+    {
+        "name": "TechCrunch Startups",
+        "url": "https://techcrunch.com/category/startups/feed/",
+        "color": "#0a8a00",
+    },
+    {
+        "name": "Crunchbase News",
+        "url": "https://news.crunchbase.com/feed/",
+        "color": "#1769ff",
+    },
+    {
+        "name": "VentureBeat",
+        "url": "https://venturebeat.com/category/business/feed/",
+        "color": "#e8460a",
+    },
+    {
+        "name": "StrictlyVC",
+        "url": "https://strictlyvc.com/feed/",
+        "color": "#7c3aed",
+    },
+]
 
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
+# Keywords to prioritize (funding, VC, acquisitions)
+PRIORITY_KEYWORDS = [
+    "raises", "raised", "funding", "series a", "series b", "series c",
+    "seed round", "pre-seed", "venture", "acquisition", "acquires",
+    "acquired", "exits", "ipo", "spac", "valuation", "unicorn",
+    "fund", "invest", "capital", "backed", "million", "billion",
+]
 
-    if resp.status_code != 200:
-        print(f"⚠️  API returned {resp.status_code}. Trying fallback endpoint...")
-        return fetch_fallback()
+# ── Fetch stories ─────────────────────────────────────────────────────────────
+def fetch_stories():
+    all_stories = []
 
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        print("⚠️  Couldn't parse JSON. Trying fallback...")
-        return fetch_fallback()
-
-    # Navigate whichever nesting YikYak uses
-    yaks = (
-        data.get("yaks") or
-        data.get("data", {}).get("yaks") or
-        data.get("records") or
-        (data if isinstance(data, list) else [])
-    )
-
-    posts = []
-    for y in yaks:
-        text  = y.get("body") or y.get("text") or y.get("message") or ""
-        votes = y.get("likeCount") or y.get("voteCount") or y.get("score") or 0
-        if text.strip() and votes >= MIN_VOTES:
-            posts.append({"text": text.strip(), "votes": int(votes)})
-
-    posts.sort(key=lambda x: x["votes"], reverse=True)
-    return posts[:TOP_N]
-
-
-def fetch_fallback():
-    """Try alternate known endpoint paths."""
-    endpoints = [
-        f"https://yikyak.com/api/fetch/v1/feed/hot?lat={UT_LAT}&long={UT_LNG}",
-        f"https://yikyak.com/api/v1/yaks?lat={UT_LAT}&lng={UT_LNG}&feed=hot",
-    ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
-        "Accept": "application/json",
-    }
-    for url in endpoints:
+    for feed_info in FEEDS:
         try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                yaks = data if isinstance(data, list) else data.get("yaks", [])
-                posts = []
-                for y in yaks:
-                    text  = y.get("body") or y.get("text") or ""
-                    votes = y.get("likeCount") or y.get("score") or 0
-                    if text.strip():
-                        posts.append({"text": text.strip(), "votes": int(votes)})
-                if posts:
-                    posts.sort(key=lambda x: x["votes"], reverse=True)
-                    return posts[:TOP_N]
+            feed = feedparser.parse(feed_info["url"])
+            for entry in feed.entries[:15]:
+                title   = entry.get("title", "").strip()
+                link    = entry.get("link", "")
+                summary = entry.get("summary", "") or entry.get("description", "")
+                # Strip HTML tags from summary
+                import re
+                summary = re.sub(r"<[^>]+>", "", summary).strip()
+                summary = summary[:200] + "..." if len(summary) > 200 else summary
+
+                # Parse published date
+                published = None
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+
+                # Score by keyword priority
+                text_lower = (title + " " + summary).lower()
+                score = sum(2 for kw in PRIORITY_KEYWORDS if kw in text_lower)
+
+                if title and link:
+                    all_stories.append({
+                        "title":     title,
+                        "link":      link,
+                        "summary":   summary,
+                        "source":    feed_info["name"],
+                        "color":     feed_info["color"],
+                        "published": published,
+                        "score":     score,
+                    })
         except Exception as e:
-            print(f"Fallback {url} failed: {e}")
-    return []
+            print(f"⚠️  Failed to fetch {feed_info['name']}: {e}")
+
+    # Deduplicate by title similarity
+    seen_titles = set()
+    unique = []
+    for s in all_stories:
+        key = s["title"].lower()[:60]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            unique.append(s)
+
+    # Sort: priority score first, then recency
+    unique.sort(key=lambda x: (x["score"], x["published"] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    return unique[:TOP_N]
 
 
 # ── Build email ───────────────────────────────────────────────────────────────
-def build_email(posts):
+def build_email(stories):
     today = date.today().strftime("%A, %B %d")
-    subject = f"🦬 YikYak Digest — {today}"
+    subject = f"🚀 VC & Startup Digest — {today}"
 
-    plain_lines = [f"YikYak Top Posts — {today}\n{'='*40}"]
-    for i, p in enumerate(posts, 1):
-        votes = f"  [{p['votes']} ▲]" if p["votes"] else ""
-        plain_lines.append(f"\n{i}. {p['text']}{votes}")
+    # Plain text
+    plain_lines = [f"VC & Startup Digest — {today}\n{'='*40}"]
+    for i, s in enumerate(stories, 1):
+        plain_lines.append(f"\n{i}. [{s['source']}] {s['title']}")
+        if s["summary"]:
+            plain_lines.append(f"   {s['summary']}")
+        plain_lines.append(f"   {s['link']}")
     plain = "\n".join(plain_lines)
 
+    # HTML
     rows = ""
-    for i, p in enumerate(posts, 1):
-        badge = (
-            f'<span style="background:#bf5700;color:#fff;padding:2px 8px;'
-            f'border-radius:12px;font-size:12px;margin-left:8px">{p["votes"]} ▲</span>'
-            if p["votes"] else ""
-        )
+    for s in stories:
+        date_str = ""
+        if s["published"]:
+            date_str = s["published"].strftime("%-m/%-d")
+
         rows += f"""
-        <tr style="border-bottom:1px solid #2a2a2a">
-          <td style="padding:14px 8px;color:#666;font-size:13px;vertical-align:top">#{i}</td>
-          <td style="padding:14px 8px;font-size:15px;line-height:1.5;color:#f0f0f0">
-            {p['text']}{badge}
+        <tr style="border-bottom:1px solid #1e1e1e">
+          <td style="padding:16px 8px;vertical-align:top">
+            <div style="margin-bottom:4px">
+              <span style="background:{s['color']};color:#fff;font-size:10px;
+                           font-weight:600;padding:2px 7px;border-radius:10px;
+                           text-transform:uppercase;letter-spacing:0.5px">
+                {s['source']}
+              </span>
+              {"<span style='color:#555;font-size:11px;margin-left:8px'>" + date_str + "</span>" if date_str else ""}
+            </div>
+            <a href="{s['link']}" style="color:#f0f0f0;font-size:15px;font-weight:600;
+                                         text-decoration:none;line-height:1.4;display:block;
+                                         margin:6px 0">
+              {s['title']}
+            </a>
+            <p style="color:#888;font-size:13px;margin:4px 0 0;line-height:1.5">
+              {s['summary']}
+            </p>
           </td>
         </tr>"""
 
     html = f"""
-    <html><body style="font-family:sans-serif;max-width:600px;margin:auto;
-                       background:#111;color:#f0f0f0;padding:24px">
-      <h2 style="color:#bf5700;border-bottom:3px solid #bf5700;padding-bottom:8px">
-        🦬 YikYak Digest &mdash; {today}
-      </h2>
-      <p style="color:#888;font-size:13px">Top {len(posts)} posts near UT Austin</p>
+    <html><body style="font-family:-apple-system,sans-serif;max-width:620px;
+                       margin:auto;background:#111;color:#f0f0f0;padding:28px 20px">
+      <div style="border-bottom:3px solid #6366f1;padding-bottom:12px;margin-bottom:20px">
+        <h1 style="margin:0;font-size:22px;color:#f0f0f0">🚀 VC & Startup Digest</h1>
+        <p style="margin:4px 0 0;color:#666;font-size:13px">{today} · Top {len(stories)} stories</p>
+      </div>
       <table style="width:100%;border-collapse:collapse">{rows}</table>
-      <p style="color:#444;font-size:11px;margin-top:24px">
-        Sent automatically each morning · UT Austin feed
+      <p style="color:#333;font-size:11px;margin-top:28px;border-top:1px solid #1e1e1e;padding-top:12px">
+        Sources: TechCrunch · Crunchbase News · VentureBeat · StrictlyVC
       </p>
     </body></html>"""
 
@@ -165,11 +181,13 @@ def send_email(subject, plain, html):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🔍 Fetching YikYak posts...")
-    posts = fetch_top_yaks()
-    if not posts:
-        print("⚠️  No posts found — YikYak may require auth or changed their API.")
+    print("🔍 Fetching stories...")
+    stories = fetch_stories()
+    if not stories:
+        print("⚠️  No stories found.")
     else:
-        print(f"📋 Got {len(posts)} posts. Building email...")
-        subject, plain, html = build_email(posts)
+        print(f"📋 Got {len(stories)} stories. Sending email...")
+        subject, plain, html = build_email(stories)
         send_email(subject, plain, html)
+        for i, s in enumerate(stories, 1):
+            print(f"  {i}. [{s['source']}] {s['title']}")
